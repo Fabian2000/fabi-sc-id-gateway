@@ -32,6 +32,8 @@ pub async fn run_server(
         App::new()
             .app_data(proxy_state_data.clone())
             .app_data(pool_data.clone())
+            // Increase payload size limit to 100MB for WebSocket messages
+            .app_data(web::PayloadConfig::new(100 * 1024 * 1024))
             .wrap(middleware::Logger::default())
             .wrap(middleware::Compress::default())
             // Admin UI routes
