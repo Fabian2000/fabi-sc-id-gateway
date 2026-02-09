@@ -117,7 +117,7 @@ pub fn setup() -> String {
             <h1>Gateway Setup</h1>
             <p>Configure your Fabi-SC ID integration to get started.</p>
             <div class="setup-info">
-                <p>Create an application at <a href="https://id.fabi-sc.de/docs/developers/register-app.html" target="_blank">id.fabi-sc.de</a>.</p>
+                <p>Create an application at <a href="https://id.fabi-sc.com/docs/developers/register-app.html" target="_blank">id.fabi-sc.com</a>.</p>
                 <p>Required scopes: <code>openid</code>, <code>username</code></p>
                 <p>Callback URL: <code>https://&lt;your-admin-origin&gt;/_admin/callback</code></p>
             </div>

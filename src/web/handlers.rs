@@ -316,7 +316,7 @@ pub async fn setup_submit(
     form: web::Form<SetupForm>,
 ) -> HttpResponse {
     let config = crate::config::IdConfig {
-        server_url: "https://id.fabi-sc.de".to_string(),
+        server_url: "https://id.fabi-sc.com".to_string(),
         app_id: form.app_id.clone(),
         api_key: form.api_key.clone(),
         admin_origin: form.admin_origin.clone(),

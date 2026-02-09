@@ -241,8 +241,8 @@ pub async fn proxy_handler(
 }
 
 /// Generate login required page with popup button.
-/// consent_url: The full URL to the ID consent page (e.g., https://id.fabi-sc.de/consent/{app_id}?redirect_uri=...)
-/// admin_origin: The origin of the admin/gateway (e.g., https://gateway.fabi-sc.de)
+/// consent_url: The full URL to the ID consent page (e.g., https://id.fabi-sc.com/consent/{app_id}?redirect_uri=...)
+/// admin_origin: The origin of the admin/gateway (e.g., https://gateway.fabi-sc.com)
 fn login_required_page(consent_url: &str, admin_origin: &str) -> HttpResponse {
     let html = format!(
         r#"<!DOCTYPE html>
