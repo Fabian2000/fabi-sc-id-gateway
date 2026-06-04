@@ -1,6 +1,6 @@
 //! HTTP proxy handler.
 
-use actix_web::{web, HttpRequest, HttpResponse};
+use actix_web::{cookie::{Cookie, SameSite, time::Duration as CookieDuration}, web, HttpRequest, HttpResponse};
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::sync::Arc;
@@ -125,8 +125,8 @@ pub async fn proxy_handler(
                 let user = match client.get_user(&token, &admin_origin).await {
                     Ok(u) => u,
                     Err(_) => {
-                        // Invalid token, show login page
-                        return Ok(login_required_page(&consent_url, &admin_origin));
+                        // Invalid/expired token: clear stale cookie so browser stops resending it.
+                        return Ok(login_required_page(&consent_url, &admin_origin, true));
                     }
                 };
 
@@ -140,7 +140,7 @@ pub async fn proxy_handler(
             }
             None => {
                 // No token, show login page with button (user interaction for popup)
-                return Ok(login_required_page(&consent_url, &admin_origin));
+                return Ok(login_required_page(&consent_url, &admin_origin, false));
             }
         }
     }
@@ -221,12 +221,14 @@ pub async fn proxy_handler(
             .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR),
     );
 
-    // Forward response headers
+    // Forward response headers. Use append (not insert) so multi-valued headers
+    // like Set-Cookie are all forwarded — insert would overwrite, dropping every
+    // cookie but the last (e.g. an upstream setting auth_token + refresh_token).
     for (name, value) in upstream_resp.headers() {
         let name_str = name.as_str().to_lowercase();
         if !is_hop_by_hop_header(&name_str) {
             if let Ok(v) = value.to_str() {
-                response.insert_header((name.as_str(), v));
+                response.append_header((name.as_str(), v));
             }
         }
     }
@@ -243,7 +245,7 @@ pub async fn proxy_handler(
 /// Generate login required page with popup button.
 /// consent_url: The full URL to the ID consent page (e.g., https://id.fabi-sc.com/consent/{app_id}?redirect_uri=...)
 /// admin_origin: The origin of the admin/gateway (e.g., https://gateway.fabi-sc.com)
-fn login_required_page(consent_url: &str, admin_origin: &str) -> HttpResponse {
+fn login_required_page(consent_url: &str, admin_origin: &str, clear_stale_cookie: bool) -> HttpResponse {
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -320,9 +322,18 @@ fn login_required_page(consent_url: &str, admin_origin: &str) -> HttpResponse {
         consent_url = consent_url,
         admin_origin = admin_origin
     );
-    HttpResponse::Unauthorized()
-        .content_type("text/html; charset=utf-8")
-        .body(html)
+    let mut builder = HttpResponse::Unauthorized();
+    builder.content_type("text/html; charset=utf-8");
+    if clear_stale_cookie {
+        // Match attributes of the cookie set in JS (path=/, SameSite=Lax) so the browser removes it.
+        let clear = Cookie::build("gateway_user_token", "")
+            .path("/")
+            .same_site(SameSite::Lax)
+            .max_age(CookieDuration::seconds(0))
+            .finish();
+        builder.cookie(clear);
+    }
+    builder.body(html)
 }
 
 /// Check if a header is a hop-by-hop header that should not be forwarded.
