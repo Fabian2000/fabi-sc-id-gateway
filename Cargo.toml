@@ -11,7 +11,9 @@ actix-ws = "0.3.1"
 anyhow = "1.0.100"
 chrono = { version = "0.4.43", features = ["serde"] }
 clap = { version = "4.5.54", features = ["derive"] }
-reqwest = { version = "0.13.1", default-features = false, features = ["json", "rustls"] }
+# "stream" provides Response::bytes_stream(), which lets the proxy forward
+# responses instead of buffering them in memory (see proxy/handler.rs).
+reqwest = { version = "0.13.1", default-features = false, features = ["json", "rustls", "stream"] }
 rustls = "0.23.36"
 rustls-pki-types = { version = "1.14.0", features = ["std"] }
 serde = { version = "1.0.228", features = ["derive"] }

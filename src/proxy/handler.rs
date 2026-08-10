@@ -1,6 +1,6 @@
 //! HTTP proxy handler.
 
-use actix_web::{cookie::{Cookie, SameSite, time::Duration as CookieDuration}, web, HttpRequest, HttpResponse};
+use actix_web::{body::SizedStream, cookie::{Cookie, SameSite, time::Duration as CookieDuration}, web, HttpRequest, HttpResponse};
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::sync::Arc;
@@ -270,15 +270,26 @@ pub async fn proxy_handler(
         }
     }
 
-    // Forward body
-    let body = upstream_resp.bytes().await.map_err(|e| {
-        error!("Failed to read upstream response body: {}", e);
-        GatewayError::Upstream(e.to_string())
-    })?;
+    // Forward the body as a stream, never buffered. `.bytes().await` collects the
+    // whole response in memory before the first byte goes out; for the multi-GB
+    // PiTV recordings (/rec/<id>) that meant 65-393 s before the player saw a
+    // single frame, and a 32 GB peak RSS for the gateway.
+    //
+    // When the length is known -- the common case, upstream sends Content-Length --
+    // use SizedStream rather than streaming(). That keeps the exact Content-Length
+    // instead of falling back to chunked encoding, which media players and
+    // downloads need for seeking and progress. Without a length, chunked is right.
+    //
+    // HEAD responses are unaffected: the h1 codec knows the HEAD flag and drops the
+    // body while still writing the headers.
+    let content_length = upstream_resp.content_length();
+    let stream = upstream_resp.bytes_stream();
 
-    Ok(response.body(body))
+    Ok(match content_length {
+        Some(len) => response.body(SizedStream::new(len, stream)),
+        None => response.streaming(stream),
+    })
 }
-
 
 /// Name of the cookie carrying the proxied user's ID token.
 pub const USER_TOKEN_COOKIE: &str = "gateway_user_token";
