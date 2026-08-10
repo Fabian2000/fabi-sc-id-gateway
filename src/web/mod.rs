@@ -58,8 +58,13 @@ pub async fn run_server(
                     .route("/api/settings/id", web::put().to(api::update_id_config))
                     .route("/api/reload", web::post().to(api::reload_routes)),
             )
+            // Establishes the proxy session cookie on a protected host after SSO
+            .route(
+                "/_gateway/session",
+                web::post().to(crate::proxy::create_proxy_session),
+            )
             // Static files for admin UI
-            .service(Files::new("/_static", "./static").show_files_listing())
+            .service(Files::new("/_static", "./static"))
             // Proxy all other requests
             .default_service(web::route().to(proxy_handler))
     });

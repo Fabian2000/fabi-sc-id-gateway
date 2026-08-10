@@ -14,6 +14,20 @@ pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<String>>
     Ok(row.map(|(v,)| v))
 }
 
+/// Set a setting value.
+pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 /// Get Fabi-SC ID configuration.
 pub async fn get_id_config(pool: &SqlitePool) -> Result<IdConfig> {
     let row: (String, Option<String>, Option<String>, Option<String>) =

@@ -26,8 +26,18 @@ async fn check_auth(req: &HttpRequest, pool: &DbPool) -> bool {
 
 /// Check if request host matches admin_origin.
 async fn check_admin_host(req: &HttpRequest, state: &web::Data<Arc<ProxyState>>) -> bool {
-    let host = req.connection_info().host().to_string();
+    let host = crate::proxy::request_host(req);
     state.is_admin_host(&host).await
+}
+
+/// Username behind the request's session, for audit records.
+async fn session_username(req: &HttpRequest, pool: &DbPool) -> Option<String> {
+    let session_id = get_session_id(req)?;
+    crate::auth::get_session(pool, &session_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.username)
 }
 
 /// List all routes.
@@ -78,13 +88,28 @@ pub async fn create_route(
         name: body.name.clone(),
         host: body.host.clone(),
         upstream_url: body.upstream_url.clone(),
-        requires_auth: body.requires_auth.unwrap_or(false),
+        // Default deny: a route that omits requires_auth must not be published
+        // to the internet unauthenticated.
+        requires_auth: body.requires_auth.unwrap_or(true),
         enabled: true,
         allowed_users: body.allowed_users.clone().unwrap_or_default(),
     };
 
     match crate::db::create_route(pool.get_ref(), &route).await {
-        Ok(_) => HttpResponse::Created().json(route),
+        Ok(_) => {
+            crate::db::audit(
+                pool.get_ref(),
+                "route.create",
+                &format!(
+                    "host={} upstream={} requires_auth={}",
+                    route.host, route.upstream_url, route.requires_auth
+                ),
+                session_username(&req, pool.get_ref()).await.as_deref(),
+                Some(&crate::proxy::client_ip(&req)),
+            )
+            .await;
+            HttpResponse::Created().json(route)
+        }
         Err(e) => HttpResponse::InternalServerError()
             .json(serde_json::json!({"error": e.to_string()})),
     }
@@ -143,7 +168,20 @@ pub async fn update_route(
     };
 
     match crate::db::update_route(pool.get_ref(), &updated).await {
-        Ok(_) => HttpResponse::Ok().json(updated),
+        Ok(_) => {
+            crate::db::audit(
+                pool.get_ref(),
+                "route.update",
+                &format!(
+                    "host={} upstream={} requires_auth={} enabled={}",
+                    updated.host, updated.upstream_url, updated.requires_auth, updated.enabled
+                ),
+                session_username(&req, pool.get_ref()).await.as_deref(),
+                Some(&crate::proxy::client_ip(&req)),
+            )
+            .await;
+            HttpResponse::Ok().json(updated)
+        }
         Err(e) => HttpResponse::InternalServerError()
             .json(serde_json::json!({"error": e.to_string()})),
     }
@@ -166,7 +204,17 @@ pub async fn delete_route(
     let route_id = path.into_inner();
 
     match crate::db::delete_route(pool.get_ref(), route_id).await {
-        Ok(_) => HttpResponse::NoContent().finish(),
+        Ok(_) => {
+            crate::db::audit(
+                pool.get_ref(),
+                "route.delete",
+                &format!("id={}", route_id),
+                session_username(&req, pool.get_ref()).await.as_deref(),
+                Some(&crate::proxy::client_ip(&req)),
+            )
+            .await;
+            HttpResponse::NoContent().finish()
+        }
         Err(e) => HttpResponse::InternalServerError()
             .json(serde_json::json!({"error": e.to_string()})),
     }
@@ -238,7 +286,20 @@ pub async fn update_id_config(
     };
 
     match crate::db::set_id_config(pool.get_ref(), &updated).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
+        Ok(_) => {
+            crate::db::audit(
+                pool.get_ref(),
+                "config.update",
+                &format!(
+                    "server_url={} app_id={} admin_origin={}",
+                    updated.server_url, updated.app_id, updated.admin_origin
+                ),
+                session_username(&req, pool.get_ref()).await.as_deref(),
+                Some(&crate::proxy::client_ip(&req)),
+            )
+            .await;
+            HttpResponse::Ok().json(serde_json::json!({"success": true}))
+        }
         Err(e) => HttpResponse::InternalServerError()
             .json(serde_json::json!({"error": e.to_string()})),
     }

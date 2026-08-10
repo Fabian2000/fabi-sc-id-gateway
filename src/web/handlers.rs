@@ -44,7 +44,7 @@ async fn get_session_from_request(req: &HttpRequest, pool: &DbPool) -> Option<Se
 }
 
 async fn check_admin_host(req: &HttpRequest, state: &web::Data<Arc<ProxyState>>) -> Option<HttpResponse> {
-    let host = req.connection_info().host().to_string();
+    let host = crate::proxy::request_host(req);
     if !state.is_admin_host(&host).await {
         Some(error_response(404, "Not Found"))
     } else {
@@ -129,9 +129,9 @@ pub async fn auth_callback(
 
     let client = IdClient::new(config);
 
-    // Get origin from request (admin origin)
-    let conn_info = req.connection_info();
-    let origin = format!("{}://{}", conn_info.scheme(), conn_info.host());
+    // Use the configured admin origin rather than request headers: the ID service
+    // matches it against the registered app origin, and headers are client-supplied.
+    let origin = client.admin_origin();
     tracing::info!("Exchange with origin: {}", origin);
 
     let exchange = match client.exchange_code(&code, &origin).await {
@@ -155,9 +155,21 @@ pub async fn auth_callback(
         None => return error_response(400, "Missing username scope"),
     };
 
-    // postMessage target origin is '*' because we can't pass state through ID service.
-    // Security: the receiver validates event.origin before accepting the message.
-    let target_origin = "*";
+    // The ID service cannot round-trip a state parameter, so the opener's origin is
+    // unknown here. Rather than posting the token to '*' — which would hand it to any
+    // page that opened this popup — post it once per configured origin. The browser
+    // only delivers the message to an opener whose origin actually matches.
+    let routes = state.routes.read().await;
+    let mut targets: Vec<String> = routes
+        .iter()
+        .map(|r| format!("https://{}", r.host))
+        .collect();
+    drop(routes);
+    targets.push(origin.clone());
+    targets.sort();
+    targets.dedup();
+
+    let targets_json = serde_json::to_string(&targets).unwrap_or_else(|_| "[]".to_string());
 
     // Return HTML that detects popup vs normal window
     // Admin check happens in callback-session for normal login flow
@@ -171,12 +183,15 @@ pub async fn auth_callback(
 <script>
 if (window.opener) {{
     // Popup mode: send token to opener and close
-    window.opener.postMessage({{
+    var payload = {{
         type: 'login_success',
         user_id: '{user_id}',
         username: '{username}',
         token: '{token}'
-    }}, '{target_origin}');
+    }};
+    {targets_json}.forEach(function (target) {{
+        try {{ window.opener.postMessage(payload, target); }} catch (e) {{}}
+    }});
     window.close();
 }} else {{
     // Normal mode: redirect to create session
@@ -189,7 +204,7 @@ if (window.opener) {{
         user_id = user.id,
         username = username,
         token = exchange.token,
-        target_origin = target_origin
+        targets_json = targets_json
     );
 
     HttpResponse::Ok()
@@ -225,8 +240,9 @@ pub async fn auth_callback_session(
     };
 
     let client = IdClient::new(config);
-    let conn_info = req.connection_info();
-    let origin = format!("{}://{}", conn_info.scheme(), conn_info.host());
+    let is_secure = req.connection_info().scheme() == "https";
+    let client_ip = crate::proxy::client_ip(&req);
+    let origin = client.admin_origin();
 
     let user = match client.get_user(&token, &origin).await {
         Ok(u) => u,
@@ -243,6 +259,14 @@ pub async fn auth_callback_session(
         .unwrap_or(false);
 
     if !is_admin {
+        crate::db::audit(
+            pool.get_ref(),
+            "admin.login_denied",
+            "reason=not_admin",
+            Some(username),
+            Some(&client_ip),
+        )
+        .await;
         return error_response(403, "Forbidden");
     }
 
@@ -253,7 +277,15 @@ pub async fn auth_callback_session(
         Err(_) => return error_response(500, "Internal Server Error"),
     };
 
-    let is_secure = conn_info.scheme() == "https";
+    crate::db::audit(
+        pool.get_ref(),
+        "admin.login",
+        "session created",
+        Some(username),
+        Some(&client_ip),
+    )
+    .await;
+
     HttpResponse::Found()
         .cookie(create_session_cookie(&session.id, is_secure))
         .insert_header(("Location", "/_admin"))
@@ -288,15 +320,16 @@ pub async fn logout(
         .finish()
 }
 
-/// First-run setup page. Accessible without auth if not yet configured.
+/// First-run setup page. Accessible without auth only while unconfigured.
 pub async fn setup_page(
     req: HttpRequest,
     pool: web::Data<DbPool>,
     state: web::Data<Arc<ProxyState>>,
 ) -> HttpResponse {
+    // Fail closed: a database error must not expose the setup wizard.
     let is_configured = crate::db::is_id_configured(pool.get_ref())
         .await
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     if is_configured {
         if let Some(response) = check_admin_host(&req, &state).await {
@@ -310,20 +343,33 @@ pub async fn setup_page(
         .body(templates::setup())
 }
 
+/// Applies the first-run setup. Refuses once the gateway is configured: it rewrites
+/// the ID credentials and replaces the admin list, so it must never be reachable
+/// by an unauthenticated caller after setup.
 pub async fn setup_submit(
+    req: HttpRequest,
     pool: web::Data<DbPool>,
-    _state: web::Data<Arc<ProxyState>>,
+    state: web::Data<Arc<ProxyState>>,
     form: web::Form<SetupForm>,
 ) -> HttpResponse {
-    let config = crate::config::IdConfig {
-        server_url: "https://id.fabi-sc.com".to_string(),
-        app_id: form.app_id.clone(),
-        api_key: form.api_key.clone(),
-        admin_origin: form.admin_origin.clone(),
-    };
+    let is_configured = crate::db::is_id_configured(pool.get_ref())
+        .await
+        .unwrap_or(true);
 
-    if crate::db::set_id_config(pool.get_ref(), &config).await.is_err() {
-        return error_response(500, "Internal Server Error");
+    if is_configured {
+        crate::db::audit(
+            pool.get_ref(),
+            "setup.refused",
+            &format!("host={} reason=already_configured", crate::proxy::request_host(&req)),
+            None,
+            Some(&crate::proxy::client_ip(&req)),
+        )
+        .await;
+
+        if let Some(response) = check_admin_host(&req, &state).await {
+            return response;
+        }
+        return redirect("/_admin");
     }
 
     let admin_users: Vec<&str> = form
@@ -337,9 +383,45 @@ pub async fn setup_submit(
         return error_response(400, "Bad Request");
     }
 
+    // The admin host must be pinned at setup time, otherwise is_admin_host has
+    // nothing to check against and the admin UI stays disabled.
+    let admin_host = match crate::proxy::host_from_origin(&form.admin_origin) {
+        Some(host) => host,
+        None => return error_response(400, "Bad Request"),
+    };
+
+    let config = crate::config::IdConfig {
+        server_url: "https://id.fabi-sc.com".to_string(),
+        app_id: form.app_id.clone(),
+        api_key: form.api_key.clone(),
+        admin_origin: form.admin_origin.clone(),
+    };
+
+    if crate::db::set_id_config(pool.get_ref(), &config).await.is_err() {
+        return error_response(500, "Internal Server Error");
+    }
+
+    if crate::db::set_setting(pool.get_ref(), "admin_host", &admin_host)
+        .await
+        .is_err()
+    {
+        return error_response(500, "Internal Server Error");
+    }
+
     if crate::db::set_admins(pool.get_ref(), &admin_users).await.is_err() {
         return error_response(500, "Internal Server Error");
     }
+
+    let _ = state.reload_routes().await;
+
+    crate::db::audit(
+        pool.get_ref(),
+        "setup.completed",
+        &format!("admin_host={} admins={}", admin_host, admin_users.join(",")),
+        None,
+        Some(&crate::proxy::client_ip(&req)),
+    )
+    .await;
 
     redirect("/_admin/login")
 }

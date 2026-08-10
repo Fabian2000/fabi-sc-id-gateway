@@ -4,7 +4,7 @@ use actix_web::{cookie::{Cookie, SameSite, time::Duration as CookieDuration}, we
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Route;
 use crate::db::DbPool;
@@ -38,28 +38,49 @@ impl ProxyState {
         let routes = crate::db::get_enabled_routes(&self.pool).await?;
         let mut guard = self.routes.write().await;
         *guard = routes;
+        drop(guard);
 
-        // Also reload admin_host from settings
-        if let Ok(Some(host)) = crate::db::get_setting(&self.pool, "admin_host").await {
-            if !host.is_empty() {
-                let mut admin_guard = self.admin_host.write().await;
-                *admin_guard = Some(host);
-            }
+        // Resolve the admin host from the explicit setting, falling back to the
+        // host of the configured admin_origin. Assigned unconditionally so that
+        // clearing the configuration also revokes admin access.
+        let setting = crate::db::get_setting(&self.pool, "admin_host")
+            .await
+            .ok()
+            .flatten();
+        let origin = match crate::db::get_id_config(&self.pool).await {
+            Ok(config) => config.admin_origin,
+            Err(_) => String::new(),
+        };
+
+        let admin_host = setting
+            .as_deref()
+            .and_then(super::host_from_origin)
+            .or_else(|| super::host_from_origin(&origin));
+
+        match &admin_host {
+            Some(host) => info!("Admin interface restricted to host: {}", host),
+            None => warn!("No admin host configured - /_admin is disabled until setup completes"),
         }
+
+        let mut admin_guard = self.admin_host.write().await;
+        *admin_guard = admin_host;
 
         Ok(())
     }
 
     /// Check if the given host is the admin host.
+    ///
+    /// Fails closed: with no admin host configured the admin interface is not
+    /// served on any hostname. First-run setup is gated separately, on the
+    /// gateway being genuinely unconfigured.
     pub async fn is_admin_host(&self, host: &str) -> bool {
         let guard = self.admin_host.read().await;
         match &*guard {
             Some(admin_host) => {
-                // Strip port from host if present
                 let host_without_port = host.split(':').next().unwrap_or(host);
-                host_without_port == admin_host
+                host_without_port.eq_ignore_ascii_case(admin_host)
             }
-            None => true, // If not configured, allow access (for initial setup)
+            None => false,
         }
     }
 }
@@ -73,7 +94,7 @@ pub async fn proxy_handler(
     let path = req.path().to_string();
     let query = req.query_string().to_string();
     let conn_info = req.connection_info().clone();
-    let host = conn_info.host().to_string();
+    let host = super::request_host(&req);
 
     // Find matching route by Host header
     let routes = state.routes.read().await;
@@ -130,9 +151,25 @@ pub async fn proxy_handler(
                     }
                 };
 
-                // Check if user is in allowed_users whitelist
-                let username = user.username.unwrap_or_default();
-                if !route.allowed_users.is_empty() && !route.allowed_users.contains(&username) {
+                // A token without a usable username cannot be authorized against
+                // the whitelist, so treat it as a failed authentication.
+                let username = match user.username.as_deref().map(str::trim) {
+                    Some(u) if !u.is_empty() => u.to_string(),
+                    _ => {
+                        warn!("Token for host {} carries no username", host);
+                        return Ok(login_required_page(&consent_url, &admin_origin, true));
+                    }
+                };
+
+                if !route.allows_user(&username) {
+                    crate::db::audit(
+                        &state.pool,
+                        "proxy.access_denied",
+                        &format!("host={} path={}", host, path),
+                        Some(&username),
+                        Some(&super::client_ip(&req)),
+                    )
+                    .await;
                     return Ok(HttpResponse::Forbidden()
                         .content_type("text/html; charset=utf-8")
                         .body(crate::web::templates::error_page(403, "Access Denied")));
@@ -187,22 +224,22 @@ pub async fn proxy_handler(
 
     let mut upstream_req = state.client.request(method, &upstream_url);
 
-    // Forward headers (excluding hop-by-hop headers)
+    // Forward headers (excluding hop-by-hop and client-supplied forwarding headers)
     for (name, value) in req.headers() {
         let name_str = name.as_str().to_lowercase();
-        if !is_hop_by_hop_header(&name_str) {
+        if !is_hop_by_hop_header(&name_str) && !is_forwarding_header(&name_str) {
             if let Ok(v) = value.to_str() {
                 upstream_req = upstream_req.header(name.as_str(), v);
             }
         }
     }
 
-    // Add X-Forwarded headers
-    if let Some(peer) = req.peer_addr() {
-        upstream_req = upstream_req.header("X-Forwarded-For", peer.ip().to_string());
-    }
+    // Set the authoritative forwarding headers. These are appended by reqwest, so
+    // the client-supplied ones must have been dropped above or the upstream would
+    // see both and typically trust the first.
+    upstream_req = upstream_req.header("X-Forwarded-For", super::client_ip(&req));
     upstream_req = upstream_req.header("X-Forwarded-Proto", conn_info.scheme());
-    upstream_req = upstream_req.header("X-Forwarded-Host", conn_info.host());
+    upstream_req = upstream_req.header("X-Forwarded-Host", &host);
 
     // Forward body
     if !body.is_empty() {
@@ -240,6 +277,109 @@ pub async fn proxy_handler(
     })?;
 
     Ok(response.body(body))
+}
+
+
+/// Name of the cookie carrying the proxied user's ID token.
+pub const USER_TOKEN_COOKIE: &str = "gateway_user_token";
+
+/// Build the proxy session cookie.
+///
+/// Mirrors the admin session cookie: HttpOnly so script can never read the bearer
+/// token, Secure, and SameSite=Lax.
+fn user_token_cookie(token: &str, secure: bool) -> Cookie<'static> {
+    Cookie::build(USER_TOKEN_COOKIE, token.to_string())
+        .path("/")
+        .http_only(true)
+        .secure(secure)
+        .same_site(SameSite::Lax)
+        .max_age(CookieDuration::hours(24))
+        .finish()
+}
+
+#[derive(serde::Deserialize)]
+pub struct SessionRequest {
+    token: String,
+}
+
+/// Exchange a token obtained through the SSO popup for an HttpOnly session cookie.
+///
+/// Served on the protected host itself, so the cookie stays scoped to that origin
+/// instead of being shared across every subdomain.
+pub async fn create_proxy_session(
+    req: HttpRequest,
+    state: web::Data<Arc<ProxyState>>,
+    body: web::Json<SessionRequest>,
+) -> HttpResponse {
+    let host = super::request_host(&req);
+    let client_ip = super::client_ip(&req);
+
+    let routes = state.routes.read().await;
+    let route = match super::find_route(&routes, &host) {
+        Some(r) => r.clone(),
+        None => return HttpResponse::NotFound().json(serde_json::json!({"error": "Not Found"})),
+    };
+    drop(routes);
+
+    let config = match crate::db::get_id_config(&state.pool).await {
+        Ok(c) => c,
+        Err(_) => {
+            return HttpResponse::InternalServerError()
+                .json(serde_json::json!({"error": "Internal Server Error"}))
+        }
+    };
+
+    let client = crate::auth::IdClient::new(config);
+    let admin_origin = client.admin_origin();
+
+    let user = match client.get_user(&body.token, &admin_origin).await {
+        Ok(u) => u,
+        Err(_) => {
+            crate::db::audit(
+                &state.pool,
+                "proxy.session_rejected",
+                &format!("host={} reason=invalid_token", host),
+                None,
+                Some(&client_ip),
+            )
+            .await;
+            return HttpResponse::Unauthorized().json(serde_json::json!({"error": "Unauthorized"}));
+        }
+    };
+
+    let username = match user.username.as_deref().map(str::trim) {
+        Some(u) if !u.is_empty() => u.to_string(),
+        _ => {
+            return HttpResponse::Unauthorized().json(serde_json::json!({"error": "Unauthorized"}))
+        }
+    };
+
+    if !route.allows_user(&username) {
+        crate::db::audit(
+            &state.pool,
+            "proxy.session_rejected",
+            &format!("host={} reason=not_allowed", host),
+            Some(&username),
+            Some(&client_ip),
+        )
+        .await;
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "Forbidden"}));
+    }
+
+    let secure = req.connection_info().scheme() == "https";
+
+    crate::db::audit(
+        &state.pool,
+        "proxy.session_created",
+        &format!("host={}", host),
+        Some(&username),
+        Some(&client_ip),
+    )
+    .await;
+
+    HttpResponse::NoContent()
+        .cookie(user_token_cookie(&body.token, secure))
+        .finish()
 }
 
 /// Generate login required page with popup button.
@@ -307,9 +447,23 @@ fn login_required_page(consent_url: &str, admin_origin: &str, clear_stale_cookie
             window.addEventListener('message', function handler(event) {{
                 if (event.origin !== '{admin_origin}') return;
                 if (event.data && event.data.type === 'login_success') {{
-                    document.cookie = 'gateway_user_token=' + event.data.token + '; path=/; SameSite=Lax';
                     window.removeEventListener('message', handler);
-                    window.location.reload();
+                    // Hand the token to the gateway, which validates it and sets an
+                    // HttpOnly cookie. The token is never stored by script.
+                    fetch('/_gateway/session', {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }},
+                        credentials: 'same-origin',
+                        body: JSON.stringify({{ token: event.data.token }})
+                    }}).then(function (res) {{
+                        if (res.ok) {{
+                            window.location.reload();
+                        }} else {{
+                            alert('Login failed: could not establish session.');
+                        }}
+                    }}).catch(function () {{
+                        alert('Login failed: could not reach the gateway.');
+                    }});
                 }} else if (event.data && event.data.type === 'login_error') {{
                     alert('Login failed: ' + event.data.error);
                     window.removeEventListener('message', handler);
@@ -325,15 +479,31 @@ fn login_required_page(consent_url: &str, admin_origin: &str, clear_stale_cookie
     let mut builder = HttpResponse::Unauthorized();
     builder.content_type("text/html; charset=utf-8");
     if clear_stale_cookie {
-        // Match attributes of the cookie set in JS (path=/, SameSite=Lax) so the browser removes it.
-        let clear = Cookie::build("gateway_user_token", "")
+        // Removal matches on name/domain/path, so this also clears the legacy
+        // script-set cookie that lacked HttpOnly.
+        let clear = Cookie::build(USER_TOKEN_COOKIE, "")
             .path("/")
+            .http_only(true)
             .same_site(SameSite::Lax)
             .max_age(CookieDuration::seconds(0))
             .finish();
         builder.cookie(clear);
     }
     builder.body(html)
+}
+
+/// Check if a header is a client-supplied forwarding header. The gateway replaces
+/// these with its own values so a client cannot spoof its identity to an upstream.
+fn is_forwarding_header(name: &str) -> bool {
+    matches!(
+        name,
+        "forwarded"
+            | "x-forwarded-for"
+            | "x-forwarded-host"
+            | "x-forwarded-port"
+            | "x-forwarded-proto"
+            | "x-real-ip"
+    )
 }
 
 /// Check if a header is a hop-by-hop header that should not be forwarded.

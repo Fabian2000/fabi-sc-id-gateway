@@ -23,3 +23,14 @@ pub struct Route {
     pub enabled: bool,
     pub allowed_users: Vec<String>,
 }
+
+impl Route {
+    /// Whether `username` may access this route.
+    ///
+    /// An empty `allowed_users` list deliberately means "any authenticated user":
+    /// the whitelist narrows access, it does not grant it. Access is still gated
+    /// by `requires_auth`, and an anonymous or nameless user never reaches here.
+    pub fn allows_user(&self, username: &str) -> bool {
+        self.allowed_users.is_empty() || self.allowed_users.iter().any(|u| u == username)
+    }
+}

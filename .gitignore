@@ -31,3 +31,6 @@ static/css/
 *.db
 *.db-shm
 *.db-wal
+
+# Timestamped database backups (they hold the api_key and live session tokens)
+*.db.bak-*

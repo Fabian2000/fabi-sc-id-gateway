@@ -1,5 +1,6 @@
 //! Database module for SQLite persistence.
 
+mod audit;
 mod migrations;
 mod routes;
 mod settings;
@@ -11,6 +12,7 @@ use std::path::Path;
 use std::str::FromStr;
 use tracing::info;
 
+pub use audit::*;
 pub use routes::*;
 pub use settings::*;
 pub use users::*;
